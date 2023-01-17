@@ -9,12 +9,12 @@ use crate::block_device::BlockData;
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Superblock {
-    pub ilist_head: u32,
-    pub num_iblocks: u32,
-    pub num_blocks: u32,
-    pub free_list_head: u32,
+    pub ilist_head: u64,
+    pub num_iblocks: u64,
+    pub num_blocks: u64,
+    pub free_list_head: u64,
 
-    _pad: [u32; 1024 - 4],
+    _pad: [u64; 512 - 4],
 }
 
 impl Debug for Superblock {
@@ -35,13 +35,13 @@ const _SUPERBLOCK_SIZE_IS_4096: () = {
 unsafe impl BlockData<4096> for Superblock {}
 
 impl Superblock {
-    pub fn new(ilist_head: u32, num_iblocks: u32, num_blocks: u32, free_list_head: u32) -> Self {
+    pub fn new(ilist_head: u64, num_iblocks: u64, num_blocks: u64, free_list_head: u64) -> Self {
         Self {
             ilist_head,
             num_iblocks,
             num_blocks,
             free_list_head,
-            _pad: [0; 1024 - 4],
+            _pad: [0; 512 - 4],
         }
     }
 }

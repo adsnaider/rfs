@@ -47,21 +47,21 @@ impl Debug for DataBlock {
 /// A block that contains addresses of free blocks as well as a chain to the next FreeNodeBlock.
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-struct FreeNodeBlock([u32; 1024]);
+struct FreeNodeBlock([u64; 512]);
 // SAFETY: Representation of free node block is transparent.
 unsafe impl BlockData<4096> for FreeNodeBlock {}
 
 impl FreeNodeBlock {
     /// Create a FreeNodeBlock that is zeroed out.
     pub fn new() -> Self {
-        Self([0; 1024])
+        Self([0; 512])
     }
 
     /// Returns the next block in the free list.
     ///
     /// There's nothing special aobut this. It just returns the last element in the block.
-    pub fn next_block(&self) -> u32 {
-        self.0[1023]
+    pub fn next_block(&self) -> u64 {
+        self.0[511]
     }
 }
 
@@ -74,7 +74,7 @@ impl<D: BlockDevice<4096>> Blobstore<D> {
 
             // Eventually we actually just pad to utilize the entire block.
             let num_inodes = num_blocks / 10;
-            let num_iblocks = (num_inodes - 1) / INodeBlock::inodes_per_block() + 1;
+            let num_iblocks = (num_inodes - 1) / INodeBlock::inodes_per_block() as u64 + 1;
 
             let ilist_head = 1;
             let free_list_head = ilist_head + num_iblocks;
@@ -96,7 +96,7 @@ impl<D: BlockDevice<4096>> Blobstore<D> {
         while bnum != 0 {
             let mut node = FreeNodeBlock::new();
             for (i, elem) in node.0.iter_mut().enumerate() {
-                let free_addr = bnum + i as u32 + 1;
+                let free_addr = bnum + i as u64 + 1;
                 if free_addr >= superblock.num_blocks {
                     break;
                 }
