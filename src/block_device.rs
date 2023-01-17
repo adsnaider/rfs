@@ -3,6 +3,11 @@
 use std::mem::MaybeUninit;
 
 /// A block device is a simple abstraction over a storage medium that operates in blocks of bytes.
+///
+/// # Safety
+///
+/// An implementation must abide by the documentation in the methods. In particular, note that
+/// passing a `bnum` >= `self.num_blocks()` should not be unsound.
 pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
     /// Reads the block `bnum` into `out`.
     ///
@@ -21,6 +26,9 @@ pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
     ///
     /// `inp`'s length must be at least a BLOCK_SIZE.
     unsafe fn write_unchecked(&mut self, bnum: u32, inp: &[u8]);
+
+    /// Returns the number of blocks associated with this device.
+    fn num_blocks(&self) -> u32;
 
     /// Reads the block `bnum` into `out`.
     ///
@@ -62,6 +70,28 @@ pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
         unsafe {
             let out = core::slice::from_raw_parts_mut(out as *mut T as *mut u8, BLOCK_SIZE);
             self.read_unchecked(bnum, out);
+        }
+    }
+
+    /// Read data in the block and returns it as T.
+    ///
+    /// This is safe because of the invariant for a type to implement `BlockData`.
+    fn read_into<T>(&self, bnum: u32) -> T
+    where
+        T: BlockData<BLOCK_SIZE>,
+    {
+        const {
+            use core::mem::size_of;
+            assert!(size_of::<T>() == BLOCK_SIZE);
+        };
+        unsafe {
+            let mut out = MaybeUninit::uninit();
+            let bytes = core::slice::from_raw_parts_mut(
+                &mut out as *mut MaybeUninit<T> as *mut u8,
+                BLOCK_SIZE,
+            );
+            self.read_unchecked(bnum, bytes);
+            out.assume_init()
         }
     }
 
@@ -114,11 +144,6 @@ impl<const BLOCK_SIZE: usize> MemoryDevice<BLOCK_SIZE> {
             buffer: vec![0; capacity].into_boxed_slice(),
         }
     }
-
-    /// Returns the number of blocks associated with this memory device.
-    pub fn num_blocks(&self) -> u32 {
-        (self.buffer.len() / BLOCK_SIZE) as u32
-    }
 }
 
 unsafe impl<const BLOCK_SIZE: usize> BlockDevice<BLOCK_SIZE> for MemoryDevice<BLOCK_SIZE> {
@@ -146,6 +171,11 @@ unsafe impl<const BLOCK_SIZE: usize> BlockDevice<BLOCK_SIZE> for MemoryDevice<BL
                 BLOCK_SIZE,
             );
         }
+    }
+
+    /// Returns the number of blocks associated with this memory device.
+    fn num_blocks(&self) -> u32 {
+        (self.buffer.len() / BLOCK_SIZE) as u32
     }
 }
 
@@ -250,6 +280,32 @@ mod tests {
         device.read(18, &mut read_block);
         assert!(read_block == write_block);
         device.read(12, &mut read_block);
+        assert!(read_block == write_block);
+    }
+
+    #[test]
+    fn read_into_and_writing_custom_type() {
+        let mut device: MemoryDevice<4096> = MemoryDevice::new(20);
+        assert_eq!(device.num_blocks(), 20);
+
+        let write_block = CustomBlockType {
+            a: 1,
+            b: 2,
+            c: 3,
+            d: 4,
+            e: 5,
+            f: 6,
+            _pad: [0u8; 4084],
+        };
+        device.write(0, &write_block);
+        device.write(18, &write_block);
+        device.write(12, &write_block);
+
+        let mut read_block: CustomBlockType = device.read_into(0);
+        assert!(read_block == write_block);
+        read_block = device.read_into(18);
+        assert!(read_block == write_block);
+        read_block = device.read_into(12);
         assert!(read_block == write_block);
     }
 
