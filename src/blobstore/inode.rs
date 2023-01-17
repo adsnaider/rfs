@@ -1,8 +1,10 @@
+use core::fmt::Debug;
+
 use crate::block_device::BlockData;
 
 /// An INode is a structure used to map files to blocks.
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub struct INode {
     pub l0_blocks: [u32; 10],
     pub l1_block: u32,
@@ -19,6 +21,18 @@ const _INODE_SIZE_IS_512: () = {
     use core::mem::size_of;
     assert!(size_of::<INode>() == 512);
 };
+
+impl Debug for INode {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("INode")
+            .field("l0_blocks", &self.l0_blocks)
+            .field("l1_block", &self.l1_block)
+            .field("l2_block", &self.l2_block)
+            .field("l3_block", &self.l3_block)
+            .field("hard_links", &self.hard_links)
+            .finish()
+    }
+}
 
 /// A block used to store a collection of INodes.
 #[repr(transparent)]

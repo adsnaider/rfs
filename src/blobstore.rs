@@ -1,6 +1,7 @@
 //! The blob storage layer of the filesystem.
 
-use std::mem::MaybeUninit;
+use core::fmt::Debug;
+use core::mem::MaybeUninit;
 
 use self::inode::INodeBlock;
 use self::superblock::Superblock;
@@ -24,10 +25,24 @@ pub struct Blobstore<D: BlockDevice<4096>> {
 
 /// A block that just contains data (say for a blob).
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 struct DataBlock([u8; 4096]);
 // SAFETY: Representation of data block is transparent.
 unsafe impl BlockData<4096> for DataBlock {}
+
+impl Debug for DataBlock {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f)?;
+        writeln!(f, "{: ^192}", "-------------------------------------- DataBlock ----------------------------------------------")?;
+        for data in self.0.chunks(64) {
+            for byte in data {
+                write!(f, "{:02X} ", byte)?;
+            }
+            writeln!(f)?;
+        }
+        writeln!(f, "{: ^192}", "-----------------------------------------------------------------------------------------------\n")
+    }
+}
 
 /// A block that contains addresses of free blocks as well as a chain to the next FreeNodeBlock.
 #[repr(transparent)]

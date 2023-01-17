@@ -1,6 +1,6 @@
 //! Block device abstraction and testing utilities.
 
-use std::mem::MaybeUninit;
+use core::mem::MaybeUninit;
 
 /// A block device is a simple abstraction over a storage medium that operates in blocks of bytes.
 ///
@@ -127,61 +127,64 @@ unsafe impl<T, const BLOCK_SIZE: usize> BlockData<BLOCK_SIZE> for MaybeUninit<T>
 {
 }
 
-/// An implementation of `BlockDevice` that stores all the data in an internal buffer.
-///
-/// This struct can be used for testing.
-#[derive(Debug, Clone)]
-pub struct MemoryDevice<const BLOCK_SIZE: usize> {
-    buffer: Box<[u8]>,
-}
-
-impl<const BLOCK_SIZE: usize> MemoryDevice<BLOCK_SIZE> {
-    /// Constructs a new MemoryDevice.
-    pub fn new(num_blocks: u32) -> Self {
-        let num_blocks = num_blocks as usize;
-        let capacity = num_blocks * BLOCK_SIZE;
-        Self {
-            buffer: vec![0; capacity].into_boxed_slice(),
-        }
-    }
-}
-
-unsafe impl<const BLOCK_SIZE: usize> BlockDevice<BLOCK_SIZE> for MemoryDevice<BLOCK_SIZE> {
-    unsafe fn read_unchecked(&self, bnum: u32, out: &mut [u8]) {
-        assert!(bnum < self.num_blocks());
-        let bnum = bnum as usize;
-
-        unsafe {
-            core::ptr::copy(
-                self.buffer.as_ptr().add(bnum * BLOCK_SIZE),
-                out.as_mut_ptr(),
-                BLOCK_SIZE,
-            );
-        }
-    }
-
-    unsafe fn write_unchecked(&mut self, bnum: u32, inp: &[u8]) {
-        assert!(bnum < self.num_blocks());
-        let bnum = bnum as usize;
-
-        unsafe {
-            core::ptr::copy(
-                inp.as_ptr(),
-                self.buffer.as_mut_ptr().add(bnum * BLOCK_SIZE),
-                BLOCK_SIZE,
-            );
-        }
-    }
-
-    /// Returns the number of blocks associated with this memory device.
-    fn num_blocks(&self) -> u32 {
-        (self.buffer.len() / BLOCK_SIZE) as u32
-    }
-}
+#[cfg(test)]
+pub use tests::MemoryDevice;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An implementation of `BlockDevice` that stores all the data in an internal buffer.
+    ///
+    /// This struct can be used for testing.
+    #[derive(Debug, Clone)]
+    pub struct MemoryDevice<const BLOCK_SIZE: usize> {
+        buffer: Box<[u8]>,
+    }
+
+    impl<const BLOCK_SIZE: usize> MemoryDevice<BLOCK_SIZE> {
+        /// Constructs a new MemoryDevice.
+        pub fn new(num_blocks: u32) -> Self {
+            let num_blocks = num_blocks as usize;
+            let capacity = num_blocks * BLOCK_SIZE;
+            Self {
+                buffer: vec![0; capacity].into_boxed_slice(),
+            }
+        }
+    }
+
+    unsafe impl<const BLOCK_SIZE: usize> BlockDevice<BLOCK_SIZE> for MemoryDevice<BLOCK_SIZE> {
+        unsafe fn read_unchecked(&self, bnum: u32, out: &mut [u8]) {
+            assert!(bnum < self.num_blocks());
+            let bnum = bnum as usize;
+
+            unsafe {
+                core::ptr::copy(
+                    self.buffer.as_ptr().add(bnum * BLOCK_SIZE),
+                    out.as_mut_ptr(),
+                    BLOCK_SIZE,
+                );
+            }
+        }
+
+        unsafe fn write_unchecked(&mut self, bnum: u32, inp: &[u8]) {
+            assert!(bnum < self.num_blocks());
+            let bnum = bnum as usize;
+
+            unsafe {
+                core::ptr::copy(
+                    inp.as_ptr(),
+                    self.buffer.as_mut_ptr().add(bnum * BLOCK_SIZE),
+                    BLOCK_SIZE,
+                );
+            }
+        }
+
+        /// Returns the number of blocks associated with this memory device.
+        fn num_blocks(&self) -> u32 {
+            (self.buffer.len() / BLOCK_SIZE) as u32
+        }
+    }
 
     #[test]
     fn simple_read_write() {
