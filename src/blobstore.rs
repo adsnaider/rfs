@@ -1,7 +1,8 @@
 //! The blob storage layer of the filesystem.
 
 use core::fmt::Debug;
-use core::mem::MaybeUninit;
+
+use bitvec::prelude::*;
 
 use self::inode::INodeBlock;
 use self::superblock::Superblock;
@@ -83,15 +84,21 @@ impl<D: BlockDevice<4096>> Blobstore<D> {
             let num_inodes = num_blocks / 10;
             let num_iblocks = (num_inodes - 1) / INodeBlock::inodes_per_block() as u64 + 1;
 
-            let ilist_head = 1;
-            let free_list_head = ilist_head + num_iblocks;
+            // One bit per inode.
+            let num_bitmap_blocks = (num_inodes - 1) / (4096 * 8) + 1;
 
-            Superblock::new(ilist_head, num_iblocks, device.num_blocks(), free_list_head)
+            Superblock::new(num_bitmap_blocks, num_iblocks, device.num_blocks())
         };
         device.write(0, &superblock);
 
+        // Next the bitmap. We just need to zero out the memory.
+        for i in superblock.bitmap_head()..superblock.ilist_head() {
+            let data_block = DataBlock([0; 4096]);
+            device.write(i, &data_block);
+        }
+
         // Now the ilist which is simply all 0.
-        for i in superblock.ilist_head..(superblock.ilist_head + superblock.num_iblocks) {
+        for i in superblock.ilist_head()..superblock.data_block_head() {
             let empty_inode = INodeBlock::new();
             device.write(i, &empty_inode);
         }
@@ -117,11 +124,10 @@ impl<D: BlockDevice<4096>> Blobstore<D> {
         Self { superblock, device }
     }
 
-    /// Opens the filesystem (without creating it again)
+    /// Opens an existing filesystem originally created with mkfs.
     pub fn openfs(device: D) -> Self {
-        let mut superblock = MaybeUninit::uninit();
-        device.read(0, &mut superblock);
-        let superblock: Superblock = unsafe { superblock.assume_init() };
+        // TODO: Use a magic number to check for correctness.
+        let superblock: Superblock = device.read_into(0);
         // Though the superblock could logically be incorrect, the data itself will never
         // be unsound.
         assert!(
@@ -136,23 +142,25 @@ impl<D: BlockDevice<4096>> Blobstore<D> {
     /// Notice the absence of a name as names are constructed from directories.
     pub fn make_blob(&mut self) -> Result<BlobHandle, BlobstoreError> {
         // Find a free INode, the index number of the inode will be the value of the handle.
-        let (bnum, mut iblock) = (self.superblock.ilist_head..)
-            .take(self.superblock.num_iblocks as usize)
-            .map(|bnum| (bnum, self.device.read_into::<INodeBlock>(bnum)))
-            .find(|(_, iblock)| iblock.0.iter().any(|inode| inode.is_available()))
-            .ok_or(BlobstoreError::OutOfInodes)?;
-
-        let mut inum = 0;
-        for (i, inode) in iblock.0.iter_mut().enumerate() {
-            if inode.is_available() {
-                inode.allocate();
-                inum = INodeBlock::inodes_per_block() as u64 * bnum + i as u64;
-                break;
+        for (block_idx, block_num, mut datablock) in (0..self.superblock.num_bitmap_blocks())
+            .map(|block_idx| (block_idx, block_idx + self.superblock.bitmap_head()))
+            .map(|(block_idx, bnum)| (block_idx, bnum, self.device.read_into::<DataBlock>(bnum)))
+        {
+            let bitmap = datablock.0.view_bits_mut::<Lsb0>();
+            let Some(idx) = bitmap.first_zero() else {
+                continue;
+            };
+            let inum: u64 = idx as u64 + block_idx as u64 * 4096 * 8;
+            if inum >= self.superblock.num_inodes() {
+                return Err(BlobstoreError::OutOfInodes);
+            } else {
+                bitmap.set(idx, true);
+                self.device.write_slice(block_num, &datablock.0);
+                return Ok(BlobHandle(inum));
             }
         }
-        debug_assert!(inum != 0);
-        self.device.write(bnum, &iblock);
-        Ok(BlobHandle(inum))
+
+        Err(BlobstoreError::OutOfInodes)
     }
 
     /// Writes the data to the specified blob at the given offset.
@@ -211,8 +219,21 @@ mod tests {
         let superblock: Superblock = fs.device.read_into(0);
         // we want 200 / 10 (20 inodes). Each block holds 8 inodes. We need 3 blocks to hold the inodes.
         let iblocks = 3;
-        assert_eq!(superblock, Superblock::new(1, iblocks, 200, iblocks + 1));
+        assert_eq!(superblock, Superblock::new(1, iblocks, 200));
         assert_eq!(superblock, fs.superblock);
+    }
+
+    #[test]
+    fn bitmap_is_initialized_correctly() {
+        let device: MemoryDevice<4096> = MemoryDevice::new(200);
+        let fs = Blobstore::mkfs(device);
+
+        for i in 0..fs.superblock.num_bitmap_blocks() {
+            let block_num = i + fs.superblock.bitmap_head();
+            let block: DataBlock = fs.device.read_into(block_num);
+            let bitmap = block.0.view_bits::<Lsb0>();
+            assert!(bitmap.first_one().is_none());
+        }
     }
 
     #[test]
@@ -221,7 +242,7 @@ mod tests {
         let fs = Blobstore::mkfs(device);
 
         let superblock = &fs.superblock;
-        for i in superblock.ilist_head..(superblock.ilist_head + superblock.num_iblocks) {
+        for i in superblock.ilist_head()..superblock.data_block_head() {
             let iblock: INodeBlock = fs.device.read_into(i);
             for inode in &iblock.0 {
                 assert_eq!(inode, &INode::new());

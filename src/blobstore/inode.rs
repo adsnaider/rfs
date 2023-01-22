@@ -1,4 +1,5 @@
 use core::fmt::Debug;
+use core::mem::size_of;
 
 use crate::block_device::BlockData;
 
@@ -12,14 +13,20 @@ pub struct INode {
     pub l3_block: u64,
 
     /// Metadata
+    pub metadata: Metadata,
+
+    _pad: [u8; 512 - 104 - size_of::<Metadata>()],
+}
+
+#[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
+pub struct Metadata {
     pub file_size: u64,
     pub hard_links: u32,
-    /// TODO: Permissions, file metadata, etc.
-    _pad: [u32; 128 - 29],
+    pub open_count: u32,
+    // TODO: Permissions, file metadata, etc.
 }
 
 const _INODE_SIZE_IS_512: () = {
-    use core::mem::size_of;
     assert!(size_of::<INode>() == 512);
 };
 
@@ -30,7 +37,7 @@ impl Debug for INode {
             .field("l1_block", &self.l1_block)
             .field("l2_block", &self.l2_block)
             .field("l3_block", &self.l3_block)
-            .field("hard_links", &self.hard_links)
+            .field("metadata", &self.metadata)
             .finish()
     }
 }
@@ -51,18 +58,19 @@ impl INode {
             l1_block: 0,
             l2_block: 0,
             l3_block: 0,
-            hard_links: 0,
-            file_size: 0,
-            _pad: [0; 128 - 29],
+            metadata: Metadata::new(),
+            _pad: [0; 392],
         }
     }
+}
 
-    pub fn is_available(&self) -> bool {
-        self.hard_links == 0
-    }
-
-    pub fn allocate(&mut self) {
-        self.hard_links = 1;
+impl Metadata {
+    pub const fn new() -> Self {
+        Self {
+            hard_links: 0,
+            file_size: 0,
+            open_count: 0,
+        }
     }
 }
 

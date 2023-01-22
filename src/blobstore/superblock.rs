@@ -1,5 +1,6 @@
 use core::fmt::Debug;
 
+use super::inode::INodeBlock;
 use crate::block_device::BlockData;
 
 /// The superblock is a special block located at the beginning of the block device.
@@ -9,18 +10,23 @@ use crate::block_device::BlockData;
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Superblock {
-    pub ilist_head: u64,
+    /// Number of bitmap blocks.
+    pub num_bitmap_blocks: u64,
+    /// Number of blocks used for the Ilist.
     pub num_iblocks: u64,
+    /// Number of blocks in the device.
     pub num_blocks: u64,
+    /// Head of the free block list.
     pub free_list_head: u64,
 
+    /// Padding to make fit in a block.
     _pad: [u64; 512 - 4],
 }
 
 impl Debug for Superblock {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Superblock")
-            .field("ilist_head", &self.ilist_head)
+            .field("num_bitmap_blocks", &self.num_bitmap_blocks)
             .field("num_iblocks", &self.num_iblocks)
             .field("num_blocks", &self.num_blocks)
             .field("free_list_head", &self.free_list_head)
@@ -35,13 +41,37 @@ const _SUPERBLOCK_SIZE_IS_4096: () = {
 unsafe impl BlockData<4096> for Superblock {}
 
 impl Superblock {
-    pub fn new(ilist_head: u64, num_iblocks: u64, num_blocks: u64, free_list_head: u64) -> Self {
+    /// Constructs a new superblock.
+    pub fn new(num_bitmap_blocks: u64, num_iblocks: u64, num_blocks: u64) -> Self {
         Self {
-            ilist_head,
+            num_bitmap_blocks,
             num_iblocks,
             num_blocks,
-            free_list_head,
+            free_list_head: 1 + num_bitmap_blocks + num_iblocks,
             _pad: [0; 512 - 4],
         }
+    }
+
+    /// Returns the start of the bitmap blocks.
+    pub const fn bitmap_head(&self) -> u64 {
+        1
+    }
+
+    /// Returns the start of the ilist head.
+    pub fn ilist_head(&self) -> u64 {
+        1 + self.num_bitmap_blocks
+    }
+
+    /// Returns the start of the data blocks.
+    pub fn data_block_head(&self) -> u64 {
+        1 + self.num_bitmap_blocks + self.num_iblocks
+    }
+
+    pub fn num_inodes(&self) -> u64 {
+        self.num_iblocks * INodeBlock::inodes_per_block() as u64
+    }
+
+    pub fn num_bitmap_blocks(&self) -> u64 {
+        self.num_bitmap_blocks
     }
 }
