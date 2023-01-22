@@ -12,9 +12,10 @@ pub struct INode {
     pub l3_block: u64,
 
     /// Metadata
+    pub file_size: u64,
     pub hard_links: u32,
     /// TODO: Permissions, file metadata, etc.
-    _pad: [u32; 128 - 27],
+    _pad: [u32; 128 - 29],
 }
 
 const _INODE_SIZE_IS_512: () = {
@@ -51,8 +52,17 @@ impl INode {
             l2_block: 0,
             l3_block: 0,
             hard_links: 0,
-            _pad: [0; 128 - 27],
+            file_size: 0,
+            _pad: [0; 128 - 29],
         }
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.hard_links == 0
+    }
+
+    pub fn allocate(&mut self) {
+        self.hard_links = 1;
     }
 }
 

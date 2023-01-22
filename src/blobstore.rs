@@ -65,6 +65,13 @@ impl FreeNodeBlock {
     }
 }
 
+/// Error type returned on some of the blobstore operations.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum BlobstoreError {
+    /// Returned when the system ran out of INodes and isn't able to create new blobs.
+    OutOfInodes,
+}
+
 impl<D: BlockDevice<4096>> Blobstore<D> {
     /// Constructs the filesystem and returns the `Blobstore`.
     pub fn mkfs(mut device: D) -> Self {
@@ -127,7 +134,58 @@ impl<D: BlockDevice<4096>> Blobstore<D> {
     /// Create a new blob.
     ///
     /// Notice the absence of a name as names are constructed from directories.
-    pub fn make_blob(&mut self) -> BlobHandle {
+    pub fn make_blob(&mut self) -> Result<BlobHandle, BlobstoreError> {
+        // Find a free INode, the index number of the inode will be the value of the handle.
+        let (bnum, mut iblock) = (self.superblock.ilist_head..)
+            .take(self.superblock.num_iblocks as usize)
+            .map(|bnum| (bnum, self.device.read_into::<INodeBlock>(bnum)))
+            .find(|(_, iblock)| iblock.0.iter().any(|inode| inode.is_available()))
+            .ok_or(BlobstoreError::OutOfInodes)?;
+
+        let mut inum = 0;
+        for (i, inode) in iblock.0.iter_mut().enumerate() {
+            if inode.is_available() {
+                inode.allocate();
+                inum = INodeBlock::inodes_per_block() as u64 * bnum + i as u64;
+                break;
+            }
+        }
+        debug_assert!(inum != 0);
+        self.device.write(bnum, &iblock);
+        Ok(BlobHandle(inum))
+    }
+
+    /// Writes the data to the specified blob at the given offset.
+    ///
+    /// The write will copy all the bytes in `data`, possibly extending the length of the blob.
+    ///
+    /// # Panics
+    ///
+    /// If `offset` > the blob's length.
+    pub fn write(&mut self, _handle: BlobHandle, _offset: u64, _data: &[u8]) {
+        todo!();
+    }
+
+    /// Reads the data starting at `offset` into `out`.
+    ///
+    /// The read will continue until reaching the length of `out` or until reaching EOF.
+    ///
+    /// # Panics
+    ///
+    /// If `off` > the blob's length.
+    pub fn read(&self, _handle: BlobHandle, _offset: u64, _out: &mut [u8]) {
+        todo!();
+    }
+
+    /// Truncates the given blob to the specified length freeing the contents past it.
+    ///
+    /// If the length of the blob is < `new_len`, this is effectively a no-op.
+    pub fn truncate(&mut self, _handle: BlobHandle, _new_len: u64) {
+        todo!();
+    }
+
+    /// Duplicates the handle to the blob, creating essentially a hard link.
+    pub fn dup(&mut self, _handle: BlobHandle) -> BlobHandle {
         todo!();
     }
 }
@@ -135,10 +193,12 @@ impl<D: BlockDevice<4096>> Blobstore<D> {
 /// A unique handle for a blob.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(transparent)]
-pub struct BlobHandle(u32);
+pub struct BlobHandle(u64);
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::inode::INode;
     use super::*;
     use crate::block_device::{BlockDevice, MemoryDevice};
@@ -207,5 +267,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn make_blob_test() {
+        let device: MemoryDevice<4096> = MemoryDevice::new(200);
+        let mut fs = Blobstore::mkfs(device);
+
+        let mut allocated_inodes = HashSet::new();
+        let num_inodes = fs.superblock.num_iblocks as usize * INodeBlock::inodes_per_block();
+
+        for i in 0..num_inodes {
+            let handle = fs
+                .make_blob()
+                .expect(&format!("Failed blob allocation {i}"));
+            println!("Got handle: {handle:?}");
+            assert!(
+                allocated_inodes.insert(handle.0),
+                "Reaused the same INode: {}",
+                handle.0
+            );
+        }
+
+        fs.make_blob().expect_err("Should be out of INodes");
+        fs.make_blob().expect_err("Should be out of INodes");
     }
 }
