@@ -1,6 +1,8 @@
+//! Superblock data.
 use core::fmt::Debug;
 
 use super::inode::INodeBlock;
+use crate::blobstore::BLOCK_SIZE;
 use crate::block_device::BlockData;
 
 /// The superblock is a special block located at the beginning of the block device.
@@ -20,7 +22,7 @@ pub struct Superblock {
     pub free_list_head: u64,
 
     /// Padding to make fit in a block.
-    _pad: [u64; 512 - 4],
+    _pad: [u64; BLOCK_SIZE as usize / 8 - 4],
 }
 
 impl Debug for Superblock {
@@ -34,11 +36,12 @@ impl Debug for Superblock {
     }
 }
 
-const _SUPERBLOCK_SIZE_IS_4096: () = {
+const _SUPERBLOCK_SIZE_IS_BLOCK_SIZE: () = {
     use core::mem::size_of;
-    assert!(size_of::<Superblock>() == 4096);
+    assert!(size_of::<Superblock>() == BLOCK_SIZE as usize);
 };
-unsafe impl BlockData<4096> for Superblock {}
+// SAFETY: All bit patterns for superblock are valid as it only contains numbers.
+unsafe impl BlockData<BLOCK_SIZE> for Superblock {}
 
 impl Superblock {
     /// Constructs a new superblock.

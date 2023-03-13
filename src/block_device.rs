@@ -8,7 +8,7 @@ use core::mem::MaybeUninit;
 ///
 /// An implementation must abide by the documentation in the methods. In particular, note that
 /// passing a `bnum` >= `self.num_blocks()` should not be unsound.
-pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
+pub unsafe trait BlockDevice<const BLOCK_SIZE: u64> {
     /// Reads the block `bnum` into `out`.
     ///
     /// This function may panic if the `bnum` is out of bounds.
@@ -16,7 +16,7 @@ pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
     /// # Safety
     ///
     /// `out`'s length must be at least a BLOCK_SIZE.
-    unsafe fn read_unchecked(&self, bnum: u64, out: &mut [u8]);
+    unsafe fn read_slice_unchecked(&self, bnum: u64, out: &mut [u8]);
 
     /// Writes the data in `inp` to the block `bnum`.
     ///
@@ -25,7 +25,7 @@ pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
     /// # Safety
     ///
     /// `inp`'s length must be at least a BLOCK_SIZE.
-    unsafe fn write_unchecked(&mut self, bnum: u64, inp: &[u8]);
+    unsafe fn write_slice_unchecked(&mut self, bnum: u64, inp: &[u8]);
 
     /// Returns the number of blocks associated with this device.
     fn num_blocks(&self) -> u64;
@@ -35,12 +35,12 @@ pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
     /// This function may panic if `bnum` is out of bounds or if `out` is smaller than BLOCK_SIZE.
     fn read_slice(&self, bnum: u64, out: &mut [u8]) {
         assert!(
-            out.len() >= BLOCK_SIZE,
+            out.len() >= BLOCK_SIZE as usize,
             "Slice must be at least the length of the block"
         );
 
         // SAFETY: Slice is long enough.
-        unsafe { self.read_unchecked(bnum, out) }
+        unsafe { self.read_slice_unchecked(bnum, out) }
     }
 
     /// Writes the data in `inp` to the block `bnum`.
@@ -48,12 +48,12 @@ pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
     /// This function may panic if `bnum` is out of bounds or if `inp` is smaller than BLOCK_SIZE.
     fn write_slice(&mut self, bnum: u64, inp: &[u8]) {
         assert!(
-            inp.len() >= BLOCK_SIZE,
+            inp.len() >= BLOCK_SIZE as usize,
             "Slice must be at least the length of the block"
         );
 
         // SAFETY: Slice is long enough.
-        unsafe { self.write_unchecked(bnum, inp) }
+        unsafe { self.write_slice_unchecked(bnum, inp) }
     }
 
     /// Reads the data in the block into the `out` by effectively performing a memcpy.
@@ -63,13 +63,28 @@ pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
     where
         T: BlockData<BLOCK_SIZE>,
     {
+        // SAFETY: BlockData guarantees that all bit patterns are valid `T`.
+        unsafe {
+            self.read_unchecked(bnum, out);
+        }
+    }
+
+    /// Reads the data in the block into the `out`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee that the bits in the disk at `bnum` constitute a valid
+    /// object of type `T`.
+    unsafe fn read_unchecked<T>(&self, bnum: u64, out: &mut T) {
         const {
             use core::mem::size_of;
-            assert!(size_of::<T>() == BLOCK_SIZE);
+            assert!(size_of::<T>() == BLOCK_SIZE as usize);
         };
+        // SAFETY: Precondition.
         unsafe {
-            let out = core::slice::from_raw_parts_mut(out as *mut T as *mut u8, BLOCK_SIZE);
-            self.read_unchecked(bnum, out);
+            let out =
+                core::slice::from_raw_parts_mut(out as *mut T as *mut u8, BLOCK_SIZE as usize);
+            self.read_slice_unchecked(bnum, out);
         }
     }
 
@@ -80,33 +95,43 @@ pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
     where
         T: BlockData<BLOCK_SIZE>,
     {
+        // SAFETY: `BlockData` guarantees that any read is valid for the type `T`.
+        unsafe { self.read_into_unchecked(bnum) }
+    }
+
+    /// Read data in the block and returns it as T.
+    ///
+    /// # Safety
+    ///
+    /// The data in the block must represent a valid object for `T`.
+    unsafe fn read_into_unchecked<T>(&self, bnum: u64) -> T {
         const {
             use core::mem::size_of;
-            assert!(size_of::<T>() == BLOCK_SIZE);
+            assert!(size_of::<T>() == BLOCK_SIZE as usize);
         };
+        // SAFETY: Precondition.
         unsafe {
             let mut out = MaybeUninit::uninit();
             let bytes = core::slice::from_raw_parts_mut(
                 &mut out as *mut MaybeUninit<T> as *mut u8,
-                BLOCK_SIZE,
+                BLOCK_SIZE as usize,
             );
-            self.read_unchecked(bnum, bytes);
+            self.read_slice_unchecked(bnum, bytes);
             out.assume_init()
         }
     }
 
-    /// Writes the data in in `inp` to disk by effectively performing a memcpy.
-    fn write<T>(&mut self, bnum: u64, inp: &T)
-    where
-        T: BlockData<BLOCK_SIZE>,
-    {
+    /// Writes the data in in `inp` to the block `bnum` in disk.
+    fn write<T>(&mut self, bnum: u64, inp: &T) {
         const {
             use core::mem::size_of;
-            assert!(size_of::<T>() == BLOCK_SIZE);
+            assert!(size_of::<T>() == BLOCK_SIZE as usize);
         };
+        // SAFETY: Statically checked that the size of T is exactly block size.
         unsafe {
-            let inp = core::slice::from_raw_parts(inp as *const T as *const u8, BLOCK_SIZE);
-            self.write_unchecked(bnum, inp);
+            let inp =
+                core::slice::from_raw_parts(inp as *const T as *const u8, BLOCK_SIZE as usize);
+            self.write_slice_unchecked(bnum, inp);
         }
     }
 }
@@ -118,14 +143,11 @@ pub unsafe trait BlockDevice<const BLOCK_SIZE: usize> {
 ///
 /// The implementor must guarantee that a read from won't cause the data in Self to be
 /// invalid.
-pub unsafe trait BlockData<const BLOCK_SIZE: usize>: Sized {}
+pub unsafe trait BlockData<const B: u64>: Sized {}
 
-unsafe impl<const BLOCK_SIZE: usize> BlockData<BLOCK_SIZE> for [u8; BLOCK_SIZE] {}
-unsafe impl<const BLOCK_SIZE: usize> BlockData<BLOCK_SIZE> for [i8; BLOCK_SIZE] {}
-unsafe impl<T, const BLOCK_SIZE: usize> BlockData<BLOCK_SIZE> for MaybeUninit<T> where
-    T: BlockData<BLOCK_SIZE>
-{
-}
+unsafe impl BlockData<4096> for [u8; 4096] {}
+unsafe impl BlockData<4096> for [i8; 4096] {}
+unsafe impl<T> BlockData<4096> for MaybeUninit<T> where T: BlockData<4096> {}
 
 #[cfg(test)]
 pub use tests::MemoryDevice;
@@ -138,51 +160,51 @@ mod tests {
     ///
     /// This struct can be used for testing.
     #[derive(Debug, Clone)]
-    pub struct MemoryDevice<const BLOCK_SIZE: usize> {
+    pub struct MemoryDevice<const BLOCK_SIZE: u64> {
         buffer: Box<[u8]>,
     }
 
-    impl<const BLOCK_SIZE: usize> MemoryDevice<BLOCK_SIZE> {
+    impl<const BLOCK_SIZE: u64> MemoryDevice<BLOCK_SIZE> {
         /// Constructs a new MemoryDevice.
         pub fn new(num_blocks: u64) -> Self {
             let num_blocks = num_blocks as usize;
-            let capacity = num_blocks * BLOCK_SIZE;
+            let capacity = num_blocks * BLOCK_SIZE as usize;
             Self {
                 buffer: vec![0; capacity].into_boxed_slice(),
             }
         }
     }
 
-    unsafe impl<const BLOCK_SIZE: usize> BlockDevice<BLOCK_SIZE> for MemoryDevice<BLOCK_SIZE> {
-        unsafe fn read_unchecked(&self, bnum: u64, out: &mut [u8]) {
+    unsafe impl<const BLOCK_SIZE: u64> BlockDevice<BLOCK_SIZE> for MemoryDevice<BLOCK_SIZE> {
+        unsafe fn read_slice_unchecked(&self, bnum: u64, out: &mut [u8]) {
             assert!(bnum < self.num_blocks());
             let bnum = bnum as usize;
 
             unsafe {
                 core::ptr::copy(
-                    self.buffer.as_ptr().add(bnum * BLOCK_SIZE),
+                    self.buffer.as_ptr().add(bnum * BLOCK_SIZE as usize),
                     out.as_mut_ptr(),
-                    BLOCK_SIZE,
+                    BLOCK_SIZE as usize,
                 );
             }
         }
 
-        unsafe fn write_unchecked(&mut self, bnum: u64, inp: &[u8]) {
+        unsafe fn write_slice_unchecked(&mut self, bnum: u64, inp: &[u8]) {
             assert!(bnum < self.num_blocks());
             let bnum = bnum as usize;
 
             unsafe {
                 core::ptr::copy(
                     inp.as_ptr(),
-                    self.buffer.as_mut_ptr().add(bnum * BLOCK_SIZE),
-                    BLOCK_SIZE,
+                    self.buffer.as_mut_ptr().add(bnum * BLOCK_SIZE as usize),
+                    BLOCK_SIZE as usize,
                 );
             }
         }
 
         /// Returns the number of blocks associated with this memory device.
         fn num_blocks(&self) -> u64 {
-            (self.buffer.len() / BLOCK_SIZE) as u64
+            (self.buffer.len() / BLOCK_SIZE as usize) as u64
         }
     }
 
