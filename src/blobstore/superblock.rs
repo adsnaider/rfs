@@ -1,5 +1,6 @@
 //! Superblock data.
 use core::fmt::Debug;
+use std::num::NonZeroU64;
 
 use super::inode::INodeBlock;
 use crate::blobstore::BLOCK_SIZE;
@@ -19,10 +20,12 @@ pub struct Superblock {
     /// Number of blocks in the device.
     pub num_blocks: u64,
     /// Head of the free block list.
-    pub free_list_head: u64,
+    pub free_list_head: Option<NonZeroU64>,
+    /// Number of bree blocks.
+    pub num_free_blocks: u64,
 
     /// Padding to make fit in a block.
-    _pad: [u64; BLOCK_SIZE as usize / 8 - 4],
+    _pad: [u64; BLOCK_SIZE as usize / 8 - 5],
 }
 
 impl Debug for Superblock {
@@ -32,6 +35,7 @@ impl Debug for Superblock {
             .field("num_iblocks", &self.num_iblocks)
             .field("num_blocks", &self.num_blocks)
             .field("free_list_head", &self.free_list_head)
+            .field("num_free_blocks", &self.num_free_blocks)
             .finish()
     }
 }
@@ -50,8 +54,9 @@ impl Superblock {
             num_bitmap_blocks,
             num_iblocks,
             num_blocks,
-            free_list_head: 1 + num_bitmap_blocks + num_iblocks,
-            _pad: [0; 512 - 4],
+            free_list_head: Some(NonZeroU64::new(1 + num_bitmap_blocks + num_iblocks).unwrap()),
+            num_free_blocks: num_blocks - num_bitmap_blocks - num_iblocks - 1,
+            _pad: [0; 512 - 5],
         }
     }
 
