@@ -18,6 +18,13 @@ use crate::block_device::BlockDevice;
 /// Block size used by the file system.
 pub const BLOCK_SIZE: u64 = 4096;
 
+fn bytes_to_blocks(bytes: u64) -> u64 {
+    if bytes == 0 {
+        return 0;
+    }
+    (bytes - 1) / BLOCK_SIZE + 1
+}
+
 /// The blob store that abstracts over a collection of data (the blob).
 ///
 /// In escense, the blob associates a unit of data into a logically contiguous store of bytes.
@@ -200,7 +207,7 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
     pub fn resize(&mut self, handle: BlobHandle, new_len: u64) -> Result<(), ResizeError> {
         let mut inode = self.read_inode(handle);
 
-        let required_blocks = (new_len - 1) / BLOCK_SIZE + 1;
+        let required_blocks = bytes_to_blocks(new_len);
         let current_block_count = inode.metadata.num_blocks;
         if required_blocks < current_block_count {
             self.deallocate_blocks_from_inode(&mut inode, current_block_count - required_blocks);
@@ -764,5 +771,38 @@ mod tests {
         let mut buf = [0u8; 12];
         assert_eq!(fs.read(blob, 0, &mut buf), 12);
         assert_eq!(&buf, b"hello world!");
+    }
+
+    #[test]
+    fn write_empty_string() {
+        let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+        let mut fs = Blobstore::mkfs(device);
+
+        let blob = fs.make_blob().expect("Failed blob allocation");
+        fs.write(blob, 0, b"").expect("Failed to write to blob");
+        let mut buf = [0u8; 0];
+        assert_eq!(fs.read(blob, 0, &mut buf), 0);
+        assert_eq!(&buf, b"");
+    }
+
+    mod proptests {
+        use proptest::*;
+
+        use super::*;
+
+        proptest! {
+            #[test]
+            fn write_read_round_trip(s in "\\PC*") {
+                let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+                let mut fs = Blobstore::mkfs(device);
+
+                let blob = fs.make_blob().expect("Failed blob allocation");
+                fs.write(blob, 0, s.as_bytes())
+                    .expect("Failed to write to blob");
+                let mut buf = vec![0u8; s.len()];
+                assert_eq!(fs.read(blob, 0, &mut buf), s.len() as u64);
+                assert_eq!(&buf, s.as_bytes());
+            }
+        }
     }
 }
