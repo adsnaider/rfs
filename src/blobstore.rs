@@ -45,14 +45,14 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
         let superblock = {
             let num_blocks = device.num_blocks();
 
-            // Eventually we actually just pad to utilize the entire block.
+            // We pad to utilize the entire block.
             let num_inodes = num_blocks / 10;
             let num_iblocks = (num_inodes - 1) / INodeBlock::inodes_per_block() + 1;
 
             // One bit per inode.
             let num_bitmap_blocks = (num_inodes - 1) / (BLOCK_SIZE * 8) + 1;
 
-            Superblock::new(num_bitmap_blocks, num_iblocks, device.num_blocks())
+            Superblock::new(num_bitmap_blocks, num_iblocks, num_blocks)
         };
         device.write(0, &superblock);
 
@@ -80,16 +80,15 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
     }
 
     /// Opens an existing filesystem originally created with mkfs.
-    pub fn openfs(device: D) -> Self {
+    pub fn openfs(device: D) -> Result<Self, FileSystemError> {
         // TODO: Use a magic number to check for correctness.
         let superblock: Superblock = device.read_into(0);
         // Though the superblock could logically be incorrect, the data itself will never
         // be unsound.
-        assert!(
-            superblock.num_blocks == device.num_blocks(),
-            "Filesystem doesn't match the device. Maybe call `mkfs` instead?"
-        );
-        Self { superblock, device }
+        if superblock.num_blocks != device.num_blocks() {
+            return Err(FileSystemError::InvalidFilesystem);
+        }
+        Ok(Self { superblock, device })
     }
 
     /// Create a new blob.
@@ -132,20 +131,20 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
         mut offset: u64,
         mut data: &[u8],
     ) -> Result<(), WriteError> {
+        // FIXME: Incredibly awkward transition with resize.
         let inode = self.read_inode(handle);
         let required_len = offset
             .checked_add(data.len() as u64)
             .ok_or(WriteError::OffsetOverflow)?;
         let new_len = u64::max(required_len, inode.metadata.file_size_bytes);
-
-        if new_len > inode.metadata.file_size_bytes {
-            self.resize(handle, new_len)?;
-        }
+        self.resize(handle, new_len)?;
+        let inode = self.read_inode(handle);
 
         while !data.is_empty() {
             let block = offset / BLOCK_SIZE;
             let index = (offset % BLOCK_SIZE) as usize;
             let count = usize::min(data.len(), BLOCK_SIZE as usize - index);
+            dbg!(count);
 
             // FIXME: Some unnecessary copies here and bit of clumsy logic.
             let mut datablock = RawBlock::zero();
@@ -201,7 +200,7 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
     pub fn resize(&mut self, handle: BlobHandle, new_len: u64) -> Result<(), ResizeError> {
         let mut inode = self.read_inode(handle);
 
-        let required_blocks = new_len / BLOCK_SIZE;
+        let required_blocks = (new_len - 1) / BLOCK_SIZE + 1;
         let current_block_count = inode.metadata.num_blocks;
         if required_blocks < current_block_count {
             self.deallocate_blocks_from_inode(&mut inode, current_block_count - required_blocks);
@@ -432,8 +431,10 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
                 inode.l0_blocks[idx as usize] = block;
             }
             InodeBlockIndex::Indirect(l1_idx) => {
-                // FIXME: Possible leak if allocate first but not after.
                 if l1_idx == 0 {
+                    if self.get_num_free_blocks() < 2 {
+                        return Err(ResizeError::OutOfBlocks);
+                    }
                     let block = self.allocate_block().ok_or(ResizeError::OutOfBlocks)?;
                     inode.l1_block = block;
                 }
@@ -443,13 +444,18 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
                 self.device.write(inode.l1_block, &l1);
             }
             InodeBlockIndex::DoubleIndirect(l2_idx, l1_idx) => {
-                // FIXME: Possible leak if allocate first but not after.
                 if l2_idx == 0 && l1_idx == 0 {
+                    if self.get_num_free_blocks() < 3 {
+                        return Err(ResizeError::OutOfBlocks);
+                    }
                     let block = self.allocate_block().ok_or(ResizeError::OutOfBlocks)?;
                     inode.l2_block = block;
                 }
                 let mut l2: AddrBlock = self.device.read_into(inode.l2_block);
                 if l1_idx == 0 {
+                    if self.get_num_free_blocks() < 2 {
+                        return Err(ResizeError::OutOfBlocks);
+                    }
                     let block = self.allocate_block().ok_or(ResizeError::OutOfBlocks)?;
                     l2[l2_idx] = block;
                     self.device.write(inode.l2_block, &l2);
@@ -460,19 +466,27 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
                 self.device.write(l2[l2_idx], &l1);
             }
             InodeBlockIndex::TripleIndirect(l3_idx, l2_idx, l1_idx) => {
-                // FIXME: Possible leak if allocate first but not after.
                 if l3_idx == 0 && l2_idx == 0 && l1_idx == 0 {
+                    if self.get_num_free_blocks() < 4 {
+                        return Err(ResizeError::OutOfBlocks);
+                    }
                     let block = self.allocate_block().ok_or(ResizeError::OutOfBlocks)?;
                     inode.l3_block = block;
                 }
                 let mut l3: AddrBlock = self.device.read_into(inode.l3_block);
                 if l2_idx == 0 && l1_idx == 0 {
+                    if self.get_num_free_blocks() < 3 {
+                        return Err(ResizeError::OutOfBlocks);
+                    }
                     let block = self.allocate_block().ok_or(ResizeError::OutOfBlocks)?;
                     l3[l3_idx] = block;
                     self.device.write(inode.l3_block, &l3);
                 }
                 let mut l2: AddrBlock = self.device.read_into(l3[l3_idx]);
                 if l1_idx == 0 {
+                    if self.get_num_free_blocks() < 2 {
+                        return Err(ResizeError::OutOfBlocks);
+                    }
                     let block = self.allocate_block().ok_or(ResizeError::OutOfBlocks)?;
                     l2[l2_idx] = block;
                     self.device.write(l3[l3_idx], &l2);
@@ -535,6 +549,8 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
     }
 
     fn get_block_in_inode(&self, inode: &INode, index: u64) -> Option<u64> {
+        dbg!(index);
+        dbg!(inode.metadata.num_blocks);
         if index >= inode.metadata.num_blocks {
             return None;
         }
@@ -557,6 +573,14 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
             }
         })
     }
+}
+
+/// Errors with the filesystem.
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum FileSystemError {
+    #[error("Invalid filesystem")]
+    InvalidFilesystem,
 }
 
 /// Errors opening a blob.
@@ -727,5 +751,18 @@ mod tests {
 
         fs.make_blob().expect_err("Should be out of INodes");
         fs.make_blob().expect_err("Should be out of INodes");
+    }
+
+    #[test]
+    fn rdwr_blob_test() {
+        let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+        let mut fs = Blobstore::mkfs(device);
+
+        let blob = fs.make_blob().expect("Failed blob allocation");
+        fs.write(blob, 0, b"hello world!")
+            .expect("Failed to write to blob");
+        let mut buf = [0u8; 12];
+        assert_eq!(fs.read(blob, 0, &mut buf), 12);
+        assert_eq!(&buf, b"hello world!");
     }
 }
