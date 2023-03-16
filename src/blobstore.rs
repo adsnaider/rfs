@@ -151,13 +151,12 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
             let block = offset / BLOCK_SIZE;
             let index = (offset % BLOCK_SIZE) as usize;
             let count = usize::min(data.len(), BLOCK_SIZE as usize - index);
-            dbg!(count);
+            let bnum = self.get_block_in_inode(&inode, block).unwrap();
 
             // FIXME: Some unnecessary copies here and bit of clumsy logic.
-            let mut datablock = RawBlock::zero();
+            let mut datablock: RawBlock = self.device.read_into(bnum);
             datablock.raw_mut()[index..(index + count)].copy_from_slice(&data[..count]);
 
-            let bnum = self.get_block_in_inode(&inode, block).unwrap();
             self.device.write(bnum, &datablock);
 
             // go to the start of the next block.
@@ -556,8 +555,6 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
     }
 
     fn get_block_in_inode(&self, inode: &INode, index: u64) -> Option<u64> {
-        dbg!(index);
-        dbg!(inode.metadata.num_blocks);
         if index >= inode.metadata.num_blocks {
             return None;
         }
@@ -657,6 +654,7 @@ mod tests {
 
     #[test]
     fn makefs_superblock_is_correct() {
+        crate::tests::init();
         let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
         let fs = Blobstore::mkfs(device);
 
@@ -669,6 +667,7 @@ mod tests {
 
     #[test]
     fn bitmap_is_initialized_correctly() {
+        crate::tests::init();
         let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
         let fs = Blobstore::mkfs(device);
 
@@ -682,6 +681,7 @@ mod tests {
 
     #[test]
     fn makefs_inodes_are_empty() {
+        crate::tests::init();
         let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
         let fs = Blobstore::mkfs(device);
 
@@ -697,6 +697,7 @@ mod tests {
 
     #[test]
     fn makefs_freelist_is_correct() {
+        crate::tests::init();
         let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
         let fs = Blobstore::mkfs(device);
 
@@ -738,6 +739,7 @@ mod tests {
 
     #[test]
     fn make_blob_test() {
+        crate::tests::init();
         let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
         let mut fs = Blobstore::mkfs(device);
 
@@ -762,6 +764,7 @@ mod tests {
 
     #[test]
     fn rdwr_blob_test() {
+        crate::tests::init();
         let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
         let mut fs = Blobstore::mkfs(device);
 
@@ -775,6 +778,7 @@ mod tests {
 
     #[test]
     fn write_empty_string() {
+        crate::tests::init();
         let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
         let mut fs = Blobstore::mkfs(device);
 
@@ -785,6 +789,21 @@ mod tests {
         assert_eq!(&buf, b"");
     }
 
+    #[test]
+    fn write_sequentially() {
+        crate::tests::init();
+        let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+        let mut fs = Blobstore::mkfs(device);
+
+        let blob = fs.make_blob().expect("Failed blob allocation");
+        fs.write(blob, 0, &[]).expect("Failed to write to blob");
+        fs.write(blob, 0, &[1]).expect("Failed to write to blob");
+        fs.write(blob, 1, &[0]).expect("Failed to write to blob");
+        let mut buf = [0u8; 2];
+        assert_eq!(fs.read(blob, 0, &mut buf), 2);
+        assert_eq!(&buf, &[1, 0]);
+    }
+
     mod proptests {
         use proptest::*;
 
@@ -792,16 +811,35 @@ mod tests {
 
         proptest! {
             #[test]
-            fn write_read_round_trip(s in "\\PC*") {
+            fn write_read_round_trip(s: Vec<u8>) {
                 let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
                 let mut fs = Blobstore::mkfs(device);
 
                 let blob = fs.make_blob().expect("Failed blob allocation");
-                fs.write(blob, 0, s.as_bytes())
+                fs.write(blob, 0, &s)
                     .expect("Failed to write to blob");
                 let mut buf = vec![0u8; s.len()];
-                assert_eq!(fs.read(blob, 0, &mut buf), s.len() as u64);
-                assert_eq!(&buf, s.as_bytes());
+                prop_assert_eq!(fs.read(blob, 0, &mut buf), s.len() as u64);
+                prop_assert_eq!(&buf, &s);
+            }
+
+            #[test]
+            fn writes_in_sequence(mut s1: Vec<u8>, s2: Vec<u8>, s3: Vec<u8>) {
+                let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+                let mut fs = Blobstore::mkfs(device);
+
+                let blob = fs.make_blob().expect("Failed blob allocation");
+                fs.write(blob, 0, &s1)
+                    .expect("Failed to write to blob");
+                fs.write(blob, s1.len() as u64, &s2)
+                    .expect("Failed to write to blob");
+                fs.write(blob, (s1.len() + s2.len()) as u64, &s3)
+                    .expect("Failed to write to blob");
+                let mut buf = vec![0u8; s1.len() + s2.len() + s3.len()];
+                prop_assert_eq!(fs.read(blob, 0, &mut buf), buf.len() as u64);
+                s1.extend(s2);
+                s1.extend(s3);
+                prop_assert_eq!(&buf, &s1);
             }
         }
     }
