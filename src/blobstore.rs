@@ -118,8 +118,13 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
                 bitmap.set(idx, true);
                 self.device.write(block_num, &bitmap_block);
                 let handle = BlobHandle(inum);
-                // zero out the inode.
-                self.write_inode(handle, &INode::empty());
+                // FIXME: Get inputs from params.
+                self.write_inode(
+                    handle,
+                    &INode::new(0, 0, Mode::restrictive(), Kind::Regular),
+                );
+                self.superblock.num_free_inodes -= 1;
+                self.device.write(0, &self.superblock);
                 return Ok(handle);
             }
         }
@@ -127,6 +132,54 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
         Err(BlobstoreError::OutOfInodes)
     }
 
+    /// Writes the contents of `data` into the block.
+    ///
+    /// The write will begin at `block_offset` and will end at the end of the block or the
+    /// end of the `data` slice. Any "untouched" bytes are guaranteed to keep their original
+    /// data.
+    ///
+    /// # Returns
+    ///
+    /// The number of bytes actually written to the block.
+    fn write_to_block(&mut self, data: &[u8], block_num: u64, block_offset: u64) -> u64 {
+        let block_offset = block_offset as usize;
+        let count = usize::min(BLOCK_SIZE as usize - block_offset, data.len());
+        if count == BLOCK_SIZE as usize {
+            debug_assert!(block_offset == 0);
+            debug_assert!(data.len() >= BLOCK_SIZE as usize);
+            unsafe { self.device.write_slice_unchecked(block_num, data) }
+        } else {
+            let mut datablock: RawBlock = self.device.read_into(block_num);
+            datablock.raw_mut()[block_offset..(block_offset + count)]
+                .copy_from_slice(&data[..count]);
+            self.device.write(block_num, &datablock);
+        }
+
+        count as u64
+    }
+
+    /// Reads the contents of the block into out.
+    ///
+    /// The read will begin at `block_offset` and will end at the end of the block or the
+    /// end of the `data` slice.
+    ///
+    /// # Returns
+    ///
+    /// The number of bytes actually read.
+    fn read_from_block(&self, out: &mut [u8], block_num: u64, block_offset: u64) -> u64 {
+        let block_offset = block_offset as usize;
+        let count = usize::min(BLOCK_SIZE as usize - block_offset, out.len());
+        if count == BLOCK_SIZE as usize {
+            debug_assert!(block_offset == 0);
+            debug_assert!(out.len() >= BLOCK_SIZE as usize);
+            unsafe { self.device.read_slice_unchecked(block_num, out) }
+        } else {
+            let datablock: RawBlock = self.device.read_into(block_num);
+            out[..count].copy_from_slice(&datablock.raw()[block_offset..(block_offset + count)]);
+        }
+
+        count as u64
+    }
     /// Writes the data to the specified blob at the given offset.
     ///
     /// The write will copy all the bytes in `data`, possibly extending the length of the blob.
@@ -145,23 +198,20 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
             .ok_or(WriteError::OffsetOverflow)?;
         let new_len = u64::max(required_len, inode.metadata.file_size_bytes);
         self.resize(handle, new_len)?;
+
+        // Inode may have changed after resize.
         let inode = self.read_inode(handle);
 
         while !data.is_empty() {
             let block = offset / BLOCK_SIZE;
-            let index = (offset % BLOCK_SIZE) as usize;
-            let count = usize::min(data.len(), BLOCK_SIZE as usize - index);
+            let block_offset = offset % BLOCK_SIZE;
             let bnum = self.get_block_in_inode(&inode, block).unwrap();
 
-            // FIXME: Some unnecessary copies here and bit of clumsy logic.
-            let mut datablock: RawBlock = self.device.read_into(bnum);
-            datablock.raw_mut()[index..(index + count)].copy_from_slice(&data[..count]);
-
-            self.device.write(bnum, &datablock);
+            let written = self.write_to_block(data, bnum, block_offset);
 
             // go to the start of the next block.
-            offset += count as u64;
-            data = &data[count..];
+            offset += written;
+            data = &data[written as usize..];
         }
         Ok(())
     }
@@ -173,7 +223,7 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
     /// # Returns
     ///
     /// The number of bytes actually read.
-    pub fn read(&self, handle: BlobHandle, mut offset: u64, out: &mut [u8]) -> u64 {
+    pub fn read(&self, handle: BlobHandle, mut offset: u64, mut out: &mut [u8]) -> u64 {
         let inode = self.read_inode(handle);
 
         let to_read = u64::min(out.len() as u64, inode.metadata.file_size_bytes - offset);
@@ -181,20 +231,14 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
 
         while read_count < to_read {
             let block = offset / BLOCK_SIZE;
-            let index = offset % BLOCK_SIZE;
-            let count = u64::min(to_read - read_count, BLOCK_SIZE - index);
-
-            // FIXME: Some unnecessary copies here and bit of clumsy logic.
-            let mut datablock = RawBlock::zero();
+            let block_offset = offset % BLOCK_SIZE;
             let bnum = self.get_block_in_inode(&inode, block).unwrap();
-            self.device.read(bnum, &mut datablock);
 
-            out[read_count as usize..(read_count + count) as usize]
-                .copy_from_slice(&datablock.raw()[index as usize..(index + count) as usize]);
+            let count = self.read_from_block(out, bnum, block_offset);
 
-            // go to the start of the next block.
             offset += count;
             read_count += count;
+            out = &mut out[count as usize..];
         }
         to_read
     }
@@ -297,6 +341,14 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
         self.superblock.num_free_blocks
     }
 
+    pub fn get_num_inodes(&self) -> u64 {
+        self.superblock.num_inodes()
+    }
+
+    pub fn get_num_free_inodes(&self) -> u64 {
+        self.superblock.num_free_inodes()
+    }
+
     /// Reads the INode from disk.
     fn read_inode(&self, handle: BlobHandle) -> INode {
         let (block, index) = self.get_inode_indices(handle);
@@ -354,6 +406,8 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
         let bitmap = bitblock.as_bitmap_mut();
         bitmap.set(bitindex, false);
         self.device.write(bitnum, &bitblock);
+        self.superblock.num_free_inodes += 1;
+        self.device.write(0, &self.superblock);
     }
 
     /// Allocates a block from the system.
@@ -383,24 +437,25 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
         self.superblock.num_free_blocks += 1;
         self.device.write(0, &self.superblock);
 
-        if self.superblock.free_list_head.is_none() {
+        let Some(head) = self.superblock.free_list_head else {
             self.device.write(bnum, &FreeNodeBlock::empty(0));
             self.superblock.free_list_head = Some(NonZeroU64::new(bnum).unwrap());
+            self.device.write(0, &self.superblock);
             return;
-        }
+        };
 
-        let head = self.superblock.free_list_head.unwrap().get();
+        let head = head.get();
         let mut free_node: FreeNodeBlock = self.device.read_into(head);
         if let Ok(()) = free_node.set_empty_slot(bnum) {
             // Found an empty slot for the block.
-            self.device.write(bnum, &free_node);
+            self.device.write(head, &free_node);
             return;
         }
 
         // Head of free list is full, make a new head with the block `bnum`.
         let new_head = FreeNodeBlock::empty(head);
-        self.superblock.free_list_head = Some(NonZeroU64::new(bnum).unwrap());
         self.device.write(bnum, &new_head);
+        self.superblock.free_list_head = Some(NonZeroU64::new(bnum).unwrap());
         self.device.write(0, &self.superblock);
     }
 
@@ -646,11 +701,122 @@ pub struct BlobHandle(u64);
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashSet;
+    use std::rc::Rc;
+
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
 
     use super::inode::INode;
     use super::*;
     use crate::block_device::{BlockDevice, MemoryDevice};
+
+    #[derive(Debug)]
+    struct FileTester<'a, D: BlockDevice<BLOCK_SIZE>> {
+        contents: Rc<RefCell<Vec<u8>>>,
+        handle: BlobHandle,
+        fs: &'a RefCell<Blobstore<D>>,
+    }
+
+    impl<'a, D: BlockDevice<BLOCK_SIZE>> FileTester<'a, D> {
+        pub fn make(fs: &'a RefCell<Blobstore<D>>) -> Result<Self, BlobstoreError> {
+            let handle = fs.borrow_mut().make_blob()?;
+            Ok(Self {
+                handle,
+                contents: Rc::new(RefCell::new(Vec::new())),
+                fs,
+            })
+        }
+
+        pub fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), WriteError> {
+            self.fs.borrow_mut().write(self.handle, offset, data)?;
+            if offset as usize + data.len() > self.contents.borrow().len() {
+                self.contents
+                    .borrow_mut()
+                    .resize(offset as usize + data.len(), 0);
+            }
+
+            self.contents.borrow_mut()[offset as usize..(offset as usize + data.len())]
+                .copy_from_slice(data);
+            self.check();
+            Ok(())
+        }
+
+        pub fn link(&self) -> Result<Self, LinkError> {
+            self.fs.borrow_mut().link(self.handle)?;
+            Ok(Self {
+                handle: self.handle,
+                contents: Rc::clone(&self.contents),
+                fs: self.fs,
+            })
+        }
+
+        pub fn metadata(&self) -> Metadata {
+            self.fs.borrow().metadata(self.handle)
+        }
+
+        pub fn check(&self) {
+            let meta = self.fs.borrow().metadata(self.handle);
+            assert_eq!(meta.file_size_bytes, self.contents.borrow().len() as u64);
+
+            let mut actual = vec![0; self.contents.borrow().len()];
+            assert_eq!(
+                self.fs.borrow_mut().read(self.handle, 0, &mut actual),
+                self.contents.borrow().len() as u64
+            );
+            assert_eq!(&*self.contents.borrow(), &actual);
+        }
+
+        pub fn read(&self, offset: u64, count: u64) -> Vec<u8> {
+            let mut out = vec![0; count as usize];
+            let read = self.fs.borrow_mut().read(self.handle, offset, &mut out);
+            out.resize(read as usize, 0);
+
+            assert_eq!(
+                &self.contents.borrow()[offset as usize..(offset as usize + read as usize)],
+                &out
+            );
+            out
+        }
+    }
+
+    impl<D: BlockDevice<BLOCK_SIZE>> Drop for FileTester<'_, D> {
+        fn drop(&mut self) {
+            self.check();
+            self.fs.borrow_mut().unlink(self.handle).unwrap();
+        }
+    }
+
+    struct ResourceChecker<'a, D: BlockDevice<BLOCK_SIZE>> {
+        original_num_available_blocks: u64,
+        original_num_available_inodes: u64,
+        fs: &'a RefCell<Blobstore<D>>,
+    }
+
+    impl<'a, D: BlockDevice<BLOCK_SIZE>> ResourceChecker<'a, D> {
+        pub fn new(fs: &'a RefCell<Blobstore<D>>) -> Self {
+            Self {
+                original_num_available_blocks: fs.borrow().get_num_free_blocks(),
+                original_num_available_inodes: fs.borrow().get_num_free_inodes(),
+                fs,
+            }
+        }
+    }
+
+    impl<D: BlockDevice<BLOCK_SIZE>> Drop for ResourceChecker<'_, D> {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.original_num_available_blocks,
+                self.fs.borrow().get_num_free_blocks()
+            );
+
+            assert_eq!(
+                self.original_num_available_inodes,
+                self.fs.borrow().get_num_free_inodes()
+            );
+        }
+    }
 
     #[test]
     fn makefs_superblock_is_correct() {
@@ -804,6 +970,133 @@ mod tests {
         assert_eq!(&buf, &[1, 0]);
     }
 
+    #[test]
+    fn many_files() {
+        crate::tests::init();
+        let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+        let fs = RefCell::new(Blobstore::mkfs(device));
+        let _resource_checker = ResourceChecker::new(&fs);
+
+        let mut blobs = Vec::new();
+
+        let num_blobs = fs.borrow().get_num_inodes();
+
+        for i in 0..num_blobs {
+            let mut tester = FileTester::make(&fs).unwrap();
+            tester
+                .write(0, format!("Hello, this is blob {i}").as_bytes())
+                .unwrap();
+
+            blobs.push(tester);
+        }
+
+        FileTester::make(&fs).unwrap_err();
+
+        for (i, tester) in blobs.iter().enumerate() {
+            assert_eq!(
+                &tester.read(0, 100),
+                format!("Hello, this is blob {i}").as_bytes()
+            )
+        }
+    }
+
+    #[test]
+    fn many_files_repeated() {
+        crate::tests::init();
+        let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+        let fs = RefCell::new(Blobstore::mkfs(device));
+        let _resource_checker = ResourceChecker::new(&fs);
+
+        for _ in 0..100 {
+            let _resource_checker = ResourceChecker::new(&fs);
+
+            let mut blobs = Vec::new();
+
+            let num_blobs = fs.borrow().get_num_inodes();
+
+            for i in 0..num_blobs {
+                let mut tester = FileTester::make(&fs).unwrap();
+                tester
+                    .write(0, format!("Hello, this is blob {i}").as_bytes())
+                    .unwrap();
+
+                blobs.push(tester);
+            }
+
+            FileTester::make(&fs).unwrap_err();
+
+            for (i, tester) in blobs.iter().enumerate() {
+                assert_eq!(
+                    &tester.read(0, 100),
+                    format!("Hello, this is blob {i}").as_bytes()
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn large_file() {
+        crate::tests::init();
+        let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+        let fs = RefCell::new(Blobstore::mkfs(device));
+        let _resource_checker = ResourceChecker::new(&fs);
+
+        let mut large_blob = FileTester::make(&fs).unwrap();
+        let mut end = 0;
+        let mut half_block = [0u8; BLOCK_SIZE as usize / 2];
+        let mut rng = StdRng::seed_from_u64(971);
+        rng.fill(&mut half_block);
+        while let Ok(()) = large_blob.write(end, &half_block) {
+            rng.fill(&mut half_block);
+            end += BLOCK_SIZE / 2;
+        }
+
+        assert!(fs.borrow().get_num_free_blocks() < 4);
+    }
+
+    #[test]
+    fn large_file_repeated() {
+        crate::tests::init();
+        let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+        let fs = RefCell::new(Blobstore::mkfs(device));
+        let _resource_checker = ResourceChecker::new(&fs);
+
+        for _ in 0..10 {
+            let _resource_checker = ResourceChecker::new(&fs);
+            let mut large_blob = FileTester::make(&fs).unwrap();
+            let mut end = 0;
+            let mut half_block = [0u8; BLOCK_SIZE as usize / 2];
+            let mut rng = StdRng::seed_from_u64(971);
+            rng.fill(&mut half_block);
+            while let Ok(()) = large_blob.write(end, &half_block) {
+                rng.fill(&mut half_block);
+                end += BLOCK_SIZE / 2;
+            }
+
+            assert!(fs.borrow().get_num_free_blocks() < 4);
+        }
+    }
+
+    #[test]
+    fn links() {
+        crate::tests::init();
+        let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+        let fs = RefCell::new(Blobstore::mkfs(device));
+        let _resource_checker = ResourceChecker::new(&fs);
+
+        let mut blob = FileTester::make(&fs).unwrap();
+        assert_eq!(blob.metadata().hard_links, 1);
+        let mut linked = blob.link().unwrap();
+        assert_eq!(blob.metadata().hard_links, 2);
+        assert_eq!(linked.metadata().hard_links, 2);
+
+        blob.write(0, b"hello world!").unwrap();
+        assert_eq!(linked.read(0, 100), b"hello world!");
+
+        linked.write(0, b"hello my friend").unwrap();
+        assert_eq!(blob.read(0, 100), b"hello my friend");
+    }
+
     mod proptests {
         use proptest::*;
 
@@ -840,6 +1133,19 @@ mod tests {
                 s1.extend(s2);
                 s1.extend(s3);
                 prop_assert_eq!(&buf, &s1);
+            }
+
+            #[test]
+            fn no_block_leaks(blocks in 1u64..160, extra in 0u64..BLOCK_SIZE) {
+                let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
+                let mut fs = Blobstore::mkfs(device);
+
+                let blob = fs.make_blob().expect("Failed blob allocation");
+                let pre_available_blocks = fs.get_num_free_blocks();
+                fs.resize(blob, blocks * BLOCK_SIZE + extra).unwrap();
+                assert!(fs.get_num_free_blocks() < pre_available_blocks);
+                fs.resize(blob, 0).unwrap();
+                prop_assert_eq!(fs.get_num_free_blocks(), pre_available_blocks);
             }
         }
     }

@@ -23,9 +23,11 @@ pub struct Superblock {
     pub free_list_head: Option<NonZeroU64>,
     /// Number of bree blocks.
     pub num_free_blocks: u64,
+    /// Number of free inodes
+    pub num_free_inodes: u64,
 
     /// Padding to make fit in a block.
-    _pad: [u64; BLOCK_SIZE as usize / 8 - 5],
+    _pad: [u64; BLOCK_SIZE as usize / 8 - 6],
 }
 
 impl Debug for Superblock {
@@ -36,6 +38,7 @@ impl Debug for Superblock {
             .field("num_blocks", &self.num_blocks)
             .field("free_list_head", &self.free_list_head)
             .field("num_free_blocks", &self.num_free_blocks)
+            .field("num_free_inodes", &self.num_free_inodes)
             .finish()
     }
 }
@@ -56,7 +59,8 @@ impl Superblock {
             num_blocks,
             free_list_head: Some(NonZeroU64::new(1 + num_bitmap_blocks + num_iblocks).unwrap()),
             num_free_blocks: num_blocks - num_bitmap_blocks - num_iblocks - 1,
-            _pad: [0; 512 - 5],
+            num_free_inodes: num_iblocks * INodeBlock::inodes_per_block(),
+            _pad: [0; 512 - 6],
         }
     }
 
@@ -77,6 +81,10 @@ impl Superblock {
 
     pub fn num_inodes(&self) -> u64 {
         self.num_iblocks * INodeBlock::inodes_per_block() as u64
+    }
+
+    pub fn num_free_inodes(&self) -> u64 {
+        self.num_free_inodes
     }
 
     pub fn num_bitmap_blocks(&self) -> u64 {

@@ -184,7 +184,7 @@ impl Metadata {
     pub fn new(uid: u16, gid: u16, mode: Mode, kind: Kind) -> Self {
         let now = Timestamp::now();
         Self {
-            hard_links: 0,
+            hard_links: 1,
             file_size_bytes: 0,
             num_blocks: 0,
             open_count: 0,
