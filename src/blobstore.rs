@@ -341,10 +341,12 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
         self.superblock.num_free_blocks
     }
 
+    /// Returns the total number of INodes.
     pub fn get_num_inodes(&self) -> u64 {
         self.superblock.num_inodes()
     }
 
+    /// Returns the number of unallocated INodes.
     pub fn get_num_free_inodes(&self) -> u64 {
         self.superblock.num_free_inodes()
     }
