@@ -9,10 +9,8 @@ use std::path::Path;
 
 use thiserror::Error;
 
-pub use crate::blobstore::{
-    BlobHandle, CloseError, LinkError, Metadata, OpenError, ResizeError, UnlinkError, WriteError,
-};
-use crate::blobstore::{Blobstore, BlobstoreError, Kind, Mode, BLOCK_SIZE};
+use crate::blobstore::{self, Blobstore, BlobstoreError, Kind, Mode, BLOCK_SIZE};
+pub use crate::blobstore::{BlobHandle, CloseError, Metadata, OpenError, ResizeError, WriteError};
 use crate::block_device::BlockDevice;
 
 const FILENAME_LENGTH: usize = 256 - size_of::<BlobHandle>();
@@ -45,6 +43,7 @@ impl<D: BlockDevice<BLOCK_SIZE>> FStore<D> {
         Self { store }
     }
 
+    /// Gets the file handle for the specified path.
     pub fn namei(&mut self, path: &Path) -> Result<BlobHandle, LookupError> {
         if path.as_os_str().len() > MAX_PATH_LEN {
             return Err(LookupError::PathTooLong);
@@ -65,11 +64,13 @@ impl<D: BlockDevice<BLOCK_SIZE>> FStore<D> {
         Ok(entry)
     }
 
+    /// Returns true if the file is a directory.
     pub fn is_dir(&self, handle: BlobHandle) -> bool {
         let meta = self.store.metadata(handle);
         meta.kind == Kind::Directory
     }
 
+    /// Creates a new regular file at the specified path.
     pub fn create(
         &mut self,
         path: &Path,
@@ -82,101 +83,14 @@ impl<D: BlockDevice<BLOCK_SIZE>> FStore<D> {
         let file_handle = self.store.make_blob(uid, gid, mode, Kind::Regular)?;
 
         if let Err(e) = self.add_entry_to_dir(dir_handle, file_handle, filename) {
-            self.store.unlink(file_handle);
+            self.store.unlink(file_handle).unwrap();
             return Err(e.into());
         }
+
         Ok(file_handle)
     }
 
-    fn add_entry_to_dir(
-        &mut self,
-        dir: BlobHandle,
-        file: BlobHandle,
-        name: &OsStr,
-    ) -> Result<(), DirEntryError> {
-        let name = name.as_bytes();
-        let length = name.len();
-        if length > FILENAME_LENGTH {
-            return Err(DirEntryError::FilenameTooLong);
-        }
-
-        let mut filename = [0; FILENAME_LENGTH];
-        filename[..length].copy_from_slice(name);
-
-        let entry = DirEntry {
-            blob: file,
-            filename,
-        };
-
-        self.write_dir_entry(dir, entry, self.num_entries_in_dir(dir));
-        Ok(())
-    }
-
-    fn write_dir_entry(
-        &mut self,
-        dir: BlobHandle,
-        entry: DirEntry,
-        n: u64,
-    ) -> Result<(), WriteError> {
-        debug_assert!(n <= self.num_entries_in_dir(dir));
-        self.store.write(dir, n * ENTRY_SIZE, entry.as_u8_slice())?;
-        Ok(())
-    }
-
-    fn rm_entry_from_dir(
-        &mut self,
-        dir: BlobHandle,
-        name: &OsStr,
-    ) -> Result<BlobHandle, RmEntryError> {
-        let (handle, idx) = self
-            .find_dir_entry(dir, name)
-            .ok_or(RmEntryError::NonExistant)?;
-        let num_entries = self.num_entries_in_dir(dir);
-
-        // If this is not the last one, then we swap it with the last entry.
-        if idx < num_entries - 1 {
-            let last_entry = self.get_dir_entry(dir, num_entries - 1).unwrap();
-            self.write_dir_entry(dir, last_entry, idx);
-        }
-        self.store.resize(dir, (num_entries - 1) * ENTRY_SIZE);
-        Ok(handle)
-    }
-
-    fn num_entries_in_dir(&self, dir: BlobHandle) -> u64 {
-        let dir_size = self.store.metadata(dir).file_size_bytes;
-        debug_assert!(dir_size % 256 == 0);
-        dir_size / ENTRY_SIZE
-    }
-
-    fn get_dir_entry(&self, dir: BlobHandle, n: u64) -> Option<DirEntry> {
-        let mut entry = MaybeUninit::uninit();
-        let num_entries = self.num_entries_in_dir(dir);
-        if n < num_entries {
-            unsafe {
-                let read = self
-                    .store
-                    .read(dir, n * ENTRY_SIZE, entry.as_u8_slice_mut());
-                debug_assert!(read == ENTRY_SIZE);
-                Some(entry.assume_init())
-            }
-        } else {
-            None
-        }
-    }
-
-    fn find_dir_entry(&self, dir: BlobHandle, name: &OsStr) -> Option<(BlobHandle, u64)> {
-        let mut n = 0;
-
-        while let Some(entry) = self.get_dir_entry(dir, n) {
-            // FIXME: This might not take into account null termination.
-            let filename = OsStr::from_bytes(&entry.filename);
-            if filename == name {
-                return Some((entry.blob, n));
-            }
-        }
-        None
-    }
-
+    /// Constructs a directory at the given path.
     pub fn mkdir(
         &mut self,
         path: &Path,
@@ -184,22 +98,65 @@ impl<D: BlockDevice<BLOCK_SIZE>> FStore<D> {
         gid: u16,
         mode: Mode,
     ) -> Result<BlobHandle, CreateError> {
-        todo!();
+        let filename = path.file_name().ok_or(CreateError::InvalidFileName)?;
+        let dir_handle = self.namei(path.parent().ok_or(CreateError::IsRoot)?)?;
+        let file_handle = self.store.make_blob(uid, gid, mode, Kind::Directory)?;
+
+        // TODO: Better pattern for undoing on error.
+        if let Err(e) = self.add_entry_to_dir(dir_handle, file_handle, filename) {
+            self.store.unlink(file_handle).unwrap();
+            return Err(e.into());
+        }
+
+        if let Err(e) = self.add_entry_to_dir(file_handle, file_handle, OsStr::new(".")) {
+            self.store.unlink(file_handle).unwrap();
+            self.rm_entry_from_dir(dir_handle, filename).unwrap();
+            return Err(e.into());
+        };
+
+        if let Err(e) = self.add_entry_to_dir(file_handle, dir_handle, OsStr::new("..")) {
+            self.store.unlink(file_handle).unwrap();
+            self.rm_entry_from_dir(dir_handle, filename).unwrap();
+            return Err(e.into());
+        };
+
+        Ok(file_handle)
     }
 
+    /// Changes the file permission bits.
     pub fn chmod(&mut self, handle: BlobHandle, mode: Mode) {
         self.store.chmod(handle, mode);
     }
 
+    /// Changes the owner of the file.
     pub fn chown(&mut self, handle: BlobHandle, uid: u16, gid: u16) {
         self.store.chown(handle, uid, gid);
     }
 
-    pub fn rename(&mut self, handle: BlobHandle, new_name: &Path) -> Result<(), RenameError> {
-        todo!();
+    /// Renames the file to the new path.
+    pub fn rename(&mut self, old: &Path, new: &Path) -> Result<(), RenameError> {
+        let old_parent = self.namei(old.parent().ok_or(RenameError::Special)?)?;
+
+        let new_parent = self.namei(new.parent().ok_or(RenameError::Special)?)?;
+
+        let old_fn = old.file_name().unwrap_or(OsStr::new(".."));
+        let new_fn = new.file_name().unwrap_or(OsStr::new(".."));
+
+        if old_fn == "." || old_fn == ".." {
+            return Err(RenameError::Special);
+        }
+
+        let entry = self.rm_entry_from_dir(old_parent, old_fn)?;
+        if let Err(e) = self.add_entry_to_dir(new_parent, entry, new_fn) {
+            self.add_entry_to_dir(old_parent, entry, old_fn).unwrap();
+            return Err(e.into());
+        };
+
+        Ok(())
     }
 
-    pub fn symlink(&mut self, from: &Path, to: &Path) -> Result<BlobHandle, SymlinkError> {
+    /// Construct a symlink to the original file.
+    pub fn symlink(&mut self, original: &Path, link: &Path) -> Result<BlobHandle, SymlinkError> {
         todo!();
     }
 
@@ -247,14 +204,30 @@ impl<D: BlockDevice<BLOCK_SIZE>> FStore<D> {
 
     /// Creates a link at the provided path.
     pub fn link(&mut self, handle: BlobHandle, linkpath: &Path) -> Result<(), LinkError> {
-        todo!();
-        self.store.link(handle)
+        let parent_handle = self.namei(linkpath.parent().ok_or(LinkError::IsRootDir)?)?;
+        let filename = linkpath.file_name().ok_or(LinkError::InvalidFileName)?;
+        self.store.link(handle)?;
+        if let Err(e) = self.add_entry_to_dir(parent_handle, handle, filename) {
+            self.store.unlink(handle).unwrap();
+            return Err(e.into());
+        }
+        Ok(())
     }
 
     /// Decrements the hard link count for the file.
     pub fn unlink(&mut self, path: &Path) -> Result<(), UnlinkError> {
-        todo!();
-        self.store.unlink(handle)
+        let filename = path.file_name().unwrap_or(OsStr::new(".."));
+        if filename == "." || filename == ".." {
+            return Err(UnlinkError::Special);
+        }
+        let handle = self.namei(path)?;
+        let parent = self
+            .namei(path.parent().ok_or(UnlinkError::Special)?)
+            .unwrap();
+
+        self.rm_entry_from_dir(parent, filename).unwrap();
+        self.store.unlink(handle).unwrap();
+        Ok(())
     }
 
     /// Returns the metadata associated with a given file.
@@ -281,10 +254,104 @@ impl<D: BlockDevice<BLOCK_SIZE>> FStore<D> {
     pub fn get_num_free_inodes(&self) -> u64 {
         self.store.get_num_free_inodes()
     }
+
+    fn add_entry_to_dir(
+        &mut self,
+        dir: BlobHandle,
+        file: BlobHandle,
+        name: &OsStr,
+    ) -> Result<(), AddEntryError> {
+        let name = name.as_bytes();
+        let length = name.len();
+        if length > FILENAME_LENGTH {
+            return Err(AddEntryError::FilenameTooLong);
+        }
+
+        let mut filename = [0; FILENAME_LENGTH];
+        filename[..length].copy_from_slice(name);
+
+        let entry = DirEntry {
+            blob: file,
+            filename,
+        };
+
+        self.write_dir_entry(dir, entry, self.num_entries_in_dir(dir))
+            .unwrap();
+        Ok(())
+    }
+
+    fn write_dir_entry(
+        &mut self,
+        dir: BlobHandle,
+        entry: DirEntry,
+        n: u64,
+    ) -> Result<(), WriteError> {
+        debug_assert!(n <= self.num_entries_in_dir(dir));
+        self.store.write(dir, n * ENTRY_SIZE, entry.as_u8_slice())?;
+        Ok(())
+    }
+
+    fn rm_entry_from_dir(
+        &mut self,
+        dir: BlobHandle,
+        name: &OsStr,
+    ) -> Result<BlobHandle, RmEntryError> {
+        let (handle, idx) = self
+            .find_dir_entry(dir, name)
+            .ok_or(RmEntryError::NonExistant)?;
+        let num_entries = self.num_entries_in_dir(dir);
+
+        // If this is not the last one, then we swap it with the last entry.
+        if idx < num_entries - 1 {
+            let last_entry = self.get_dir_entry(dir, num_entries - 1).unwrap();
+            self.write_dir_entry(dir, last_entry, idx).unwrap();
+        }
+        self.store
+            .resize(dir, (num_entries - 1) * ENTRY_SIZE)
+            .unwrap();
+        Ok(handle)
+    }
+
+    fn num_entries_in_dir(&self, dir: BlobHandle) -> u64 {
+        let dir_size = self.store.metadata(dir).file_size_bytes;
+        debug_assert!(dir_size % 256 == 0);
+        dir_size / ENTRY_SIZE
+    }
+
+    fn get_dir_entry(&mut self, dir: BlobHandle, n: u64) -> Option<DirEntry> {
+        let mut entry = MaybeUninit::uninit();
+        let num_entries = self.num_entries_in_dir(dir);
+        if n < num_entries {
+            unsafe {
+                let read = self
+                    .store
+                    .read(dir, n * ENTRY_SIZE, entry.as_u8_slice_mut());
+                debug_assert!(read == ENTRY_SIZE);
+                Some(entry.assume_init())
+            }
+        } else {
+            None
+        }
+    }
+
+    fn find_dir_entry(&mut self, dir: BlobHandle, name: &OsStr) -> Option<(BlobHandle, u64)> {
+        let mut n = 0;
+
+        while let Some(entry) = self.get_dir_entry(dir, n) {
+            // FIXME: This might not take into account null termination.
+            let filename = OsStr::from_bytes(&entry.filename);
+            if filename == name {
+                return Some((entry.blob, n));
+            }
+            n += 1;
+        }
+        None
+    }
 }
 
 /// Errors translating a path to the underlying file.
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub enum LookupError {
     #[error("The path is longer than the supported maximum")]
     PathTooLong,
@@ -296,6 +363,7 @@ pub enum LookupError {
 
 /// Errors creating a file.
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub enum CreateError {
     #[error("Parent directory doesn't exist")]
     ParentDirLookup(#[from] LookupError),
@@ -306,12 +374,13 @@ pub enum CreateError {
     #[error("File name is not valid")]
     InvalidFileName,
     #[error("Error adding filename to directory")]
-    DirectoryEntryError(#[from] DirEntryError),
+    DirectoryEntryError(#[from] AddEntryError),
 }
 
 /// Errors extending a directory.
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
-pub enum DirEntryError {
+#[allow(missing_docs)]
+pub enum AddEntryError {
     #[error("Filename is longer than 240 bytes")]
     FilenameTooLong,
     #[error("Error adding the entry to the directory")]
@@ -320,6 +389,7 @@ pub enum DirEntryError {
 
 /// Errors removing an entry from the directory.
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub enum RmEntryError {
     #[error("The entry can't be removed because it doesn't exist")]
     NonExistant,
@@ -327,11 +397,48 @@ pub enum RmEntryError {
 
 /// Errors renaming a file.
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
-pub enum RenameError {}
+#[allow(missing_docs)]
+pub enum RenameError {
+    #[error("Error looking up linkpath")]
+    LookupError(#[from] LookupError),
+    #[error("The linkpath is a special file that can't be unlinked")]
+    Special,
+    #[error("Error removing the entry from the old path")]
+    RmEntryError(#[from] RmEntryError),
+    #[error("Error adding the entry to the new path")]
+    AddEntryError(#[from] AddEntryError),
+}
 
 /// Errors renaming a file.
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub enum SymlinkError {}
+
+/// Errors linking a file.
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum LinkError {
+    #[error("Error incrementing the link count")]
+    LinkError(#[from] blobstore::LinkError),
+    #[error("The linkpath is the root directory")]
+    IsRootDir,
+    #[error("Error looking up linkpath")]
+    LookupError(#[from] LookupError),
+    #[error("Linkpath filename is invalid")]
+    InvalidFileName,
+    #[error("Error adding entry to parent directory")]
+    AddEntryError(#[from] AddEntryError),
+}
+
+/// Errors unlinking a file.
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum UnlinkError {
+    #[error("Error looking up linkpath")]
+    LookupError(#[from] LookupError),
+    #[error("The linkpath is a special file that can't be unlinked")]
+    Special,
+}
 
 trait AsU8Slice
 where

@@ -630,6 +630,7 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
         })
     }
 
+    /// Changes the file permission bits.
     pub fn chmod(&mut self, handle: BlobHandle, mode: Mode) {
         let mut inode = self.read_inode(handle);
         inode.metadata.mode = mode;
@@ -637,6 +638,7 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
         // FIXME: timestmaps.
     }
 
+    /// Changes the owner of the file.
     pub fn chown(&mut self, handle: BlobHandle, uid: u16, gid: u16) {
         let mut inode = self.read_inode(handle);
         inode.metadata.uid = uid;
@@ -648,6 +650,7 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
 
 /// Error type returned on some of the blobstore operations.
 #[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+#[allow(missing_docs)]
 pub enum BlobstoreError {
     #[error("Returned when the system ran out of INodes and isn't able to create new blobs")]
     OutOfInodes,
