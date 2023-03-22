@@ -7,6 +7,7 @@
 
 pub mod blobstore;
 pub mod block_device;
+pub mod fstore;
 
 #[cfg(test)]
 mod tests {

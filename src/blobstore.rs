@@ -38,13 +38,6 @@ pub struct Blobstore<D: BlockDevice<BLOCK_SIZE>> {
     device: D,
 }
 
-/// Error type returned on some of the blobstore operations.
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum BlobstoreError {
-    /// Returned when the system ran out of INodes and isn't able to create new blobs.
-    OutOfInodes,
-}
-
 impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
     /// Constructs the filesystem and returns the `Blobstore`.
     pub fn mkfs(mut device: D) -> Self {
@@ -101,7 +94,13 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
     /// Create a new blob.
     ///
     /// Notice the absence of a name as names are constructed from directories.
-    pub fn make_blob(&mut self) -> Result<BlobHandle, BlobstoreError> {
+    pub fn make_blob(
+        &mut self,
+        uid: u16,
+        gid: u16,
+        mode: Mode,
+        kind: Kind,
+    ) -> Result<BlobHandle, BlobstoreError> {
         // Find a free INode, the index number of the inode will be the value of the handle.
         for (block_idx, block_num, mut bitmap_block) in (0..self.superblock.num_bitmap_blocks())
             .map(|block_idx| (block_idx, block_idx + self.superblock.bitmap_head()))
@@ -118,11 +117,7 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
                 bitmap.set(idx, true);
                 self.device.write(block_num, &bitmap_block);
                 let handle = BlobHandle(inum);
-                // FIXME: Get inputs from params.
-                self.write_inode(
-                    handle,
-                    &INode::new(0, 0, Mode::restrictive(), Kind::Regular),
-                );
+                self.write_inode(handle, &INode::new(uid, gid, mode, kind));
                 self.superblock.num_free_inodes -= 1;
                 self.device.write(0, &self.superblock);
                 return Ok(handle);
@@ -223,7 +218,7 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
     /// # Returns
     ///
     /// The number of bytes actually read.
-    pub fn read(&self, handle: BlobHandle, mut offset: u64, mut out: &mut [u8]) -> u64 {
+    pub fn read(&mut self, handle: BlobHandle, mut offset: u64, mut out: &mut [u8]) -> u64 {
         let inode = self.read_inode(handle);
 
         let to_read = u64::min(out.len() as u64, inode.metadata.file_size_bytes - offset);
@@ -634,6 +629,28 @@ impl<D: BlockDevice<BLOCK_SIZE>> Blobstore<D> {
             }
         })
     }
+
+    pub fn chmod(&mut self, handle: BlobHandle, mode: Mode) {
+        let mut inode = self.read_inode(handle);
+        inode.metadata.mode = mode;
+        self.write_inode(handle, &inode);
+        // FIXME: timestmaps.
+    }
+
+    pub fn chown(&mut self, handle: BlobHandle, uid: u16, gid: u16) {
+        let mut inode = self.read_inode(handle);
+        inode.metadata.uid = uid;
+        inode.metadata.gid = gid;
+        self.write_inode(handle, &inode);
+        // FIXME: timestmaps.
+    }
+}
+
+/// Error type returned on some of the blobstore operations.
+#[derive(Error, Debug, Copy, Clone, Eq, PartialEq)]
+pub enum BlobstoreError {
+    #[error("Returned when the system ran out of INodes and isn't able to create new blobs")]
+    OutOfInodes,
 }
 
 /// Errors with the filesystem.
@@ -699,7 +716,7 @@ pub enum WriteError {
 /// A unique handle for a blob.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(transparent)]
-pub struct BlobHandle(u64);
+pub struct BlobHandle(pub u64);
 
 #[cfg(test)]
 mod tests {
@@ -723,7 +740,9 @@ mod tests {
 
     impl<'a, D: BlockDevice<BLOCK_SIZE>> FileTester<'a, D> {
         pub fn make(fs: &'a RefCell<Blobstore<D>>) -> Result<Self, BlobstoreError> {
-            let handle = fs.borrow_mut().make_blob()?;
+            let handle = fs
+                .borrow_mut()
+                .make_blob(0, 0, Mode::restrictive(), Kind::Regular)?;
             Ok(Self {
                 handle,
                 contents: Rc::new(RefCell::new(Vec::new())),
@@ -916,7 +935,7 @@ mod tests {
 
         for i in 0..num_inodes {
             let handle = fs
-                .make_blob()
+                .make_blob(0, 0, Mode::restrictive(), Kind::Regular)
                 .expect(&format!("Failed blob allocation {i}"));
             println!("Got handle: {handle:?}");
             assert!(
@@ -926,8 +945,10 @@ mod tests {
             );
         }
 
-        fs.make_blob().expect_err("Should be out of INodes");
-        fs.make_blob().expect_err("Should be out of INodes");
+        fs.make_blob(0, 0, Mode::restrictive(), Kind::Regular)
+            .expect_err("Should be out of INodes");
+        fs.make_blob(0, 0, Mode::restrictive(), Kind::Regular)
+            .expect_err("Should be out of INodes");
     }
 
     #[test]
@@ -936,7 +957,9 @@ mod tests {
         let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
         let mut fs = Blobstore::mkfs(device);
 
-        let blob = fs.make_blob().expect("Failed blob allocation");
+        let blob = fs
+            .make_blob(0, 0, Mode::restrictive(), Kind::Regular)
+            .expect("Failed blob allocation");
         fs.write(blob, 0, b"hello world!")
             .expect("Failed to write to blob");
         let mut buf = [0u8; 12];
@@ -950,7 +973,9 @@ mod tests {
         let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
         let mut fs = Blobstore::mkfs(device);
 
-        let blob = fs.make_blob().expect("Failed blob allocation");
+        let blob = fs
+            .make_blob(0, 0, Mode::restrictive(), Kind::Regular)
+            .expect("Failed blob allocation");
         fs.write(blob, 0, b"").expect("Failed to write to blob");
         let mut buf = [0u8; 0];
         assert_eq!(fs.read(blob, 0, &mut buf), 0);
@@ -963,7 +988,9 @@ mod tests {
         let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
         let mut fs = Blobstore::mkfs(device);
 
-        let blob = fs.make_blob().expect("Failed blob allocation");
+        let blob = fs
+            .make_blob(0, 0, Mode::restrictive(), Kind::Regular)
+            .expect("Failed blob allocation");
         fs.write(blob, 0, &[]).expect("Failed to write to blob");
         fs.write(blob, 0, &[1]).expect("Failed to write to blob");
         fs.write(blob, 1, &[0]).expect("Failed to write to blob");
@@ -1110,7 +1137,7 @@ mod tests {
                 let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
                 let mut fs = Blobstore::mkfs(device);
 
-                let blob = fs.make_blob().expect("Failed blob allocation");
+                let blob = fs.make_blob(0, 0, Mode::restrictive(), Kind::Regular).expect("Failed blob allocation");
                 fs.write(blob, 0, &s)
                     .expect("Failed to write to blob");
                 let mut buf = vec![0u8; s.len()];
@@ -1123,7 +1150,7 @@ mod tests {
                 let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
                 let mut fs = Blobstore::mkfs(device);
 
-                let blob = fs.make_blob().expect("Failed blob allocation");
+                let blob = fs.make_blob(0, 0, Mode::restrictive(), Kind::Regular).expect("Failed blob allocation");
                 fs.write(blob, 0, &s1)
                     .expect("Failed to write to blob");
                 fs.write(blob, s1.len() as u64, &s2)
@@ -1142,7 +1169,7 @@ mod tests {
                 let device: MemoryDevice<BLOCK_SIZE> = MemoryDevice::new(200);
                 let mut fs = Blobstore::mkfs(device);
 
-                let blob = fs.make_blob().expect("Failed blob allocation");
+                let blob = fs.make_blob(0, 0, Mode::restrictive(), Kind::Regular).expect("Failed blob allocation");
                 let pre_available_blocks = fs.get_num_free_blocks();
                 fs.resize(blob, blocks * BLOCK_SIZE + extra).unwrap();
                 assert!(fs.get_num_free_blocks() < pre_available_blocks);
